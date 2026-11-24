@@ -1,0 +1,163 @@
+name: macos-nightly
+
+on:
+  workflow_call:
+    inputs:
+      project:
+        description: Name used for the zip, e.g. ps5slop gives ps5slop-macos-arm64.zip.
+        required: true
+        type: string
+      app:
+        description: The bundle the bundle command makes, e.g. target/ps5slop.app.
+        required: true
+        type: string
+      binary:
+        description: The emulator inside the bundle, e.g. Contents/MacOS/ps5slop.
+        required: true
+        type: string
+      bundle:
+        description: Builds the bundle. Runs with SLOP_COMMIT set.
+        required: true
+        type: string
+      checks:
+        description: Must pass before anything is built for upload.
+        type: string
+        default: nix develop . -c cargo fmt --all --check && nix develop . -c cargo test --workspace
+      linux-build:
+        description: Runs first on x86_64 Linux, for files a Mac cannot build. Leaves them in linux-out.
+        type: string
+        default: ""
+      linux-out:
+        description: The directory linux-build writes, put at the same path before the bundle is built.
+        type: string
+        default: ""
+      cargo-target:
+        description: The cargo target directory to cache.
+        type: string
+        default: target
+      force:
+        description: Builds even when the newest commit already has a nightly.
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: nightly-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  changed:
+    runs-on: ubuntu-latest
+    outputs:
+      build: ${{ steps.compare.outputs.build }}
+      last: ${{ steps.compare.outputs.last }}
+    steps:
+      - id: compare
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          last=$(gh api "repos/${{ github.repository }}/git/ref/tags/nightly" -q .object.sha 2>/dev/null || true)
+          echo "nightly is at '${last}', ${{ github.ref_name }} is at ${{ github.sha }}"
+          echo "last=$last" >>"$GITHUB_OUTPUT"
+          if [ "$last" = "${{ github.sha }}" ] && [ "${{ inputs.force }}" != true ]; then
+            echo "build=false" >>"$GITHUB_OUTPUT"
+          else
+            echo "build=true" >>"$GITHUB_OUTPUT"
+          fi
+
+  linux:
+    needs: changed
+    if: needs.changed.outputs.build == 'true' && inputs.linux-build != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - uses: cachix/install-nix-action@v31
+      - name: Build
+        run: ${{ inputs.linux-build }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-out
+          path: ${{ inputs.linux-out }}
+          if-no-files-found: error
+
+  nightly:
+    needs: [changed, linux]
+    if: always() && needs.changed.outputs.build == 'true' && needs.linux.result != 'failure'
+    runs-on: macos-26
+    timeout-minutes: 150
+    env:
+      SLOP_COMMIT: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: cachix/install-nix-action@v31
+      - uses: nix-community/cache-nix-action@v6
+        with:
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.lock', 'flake.nix') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-
+          gc-max-store-size: 8G
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> ${{ inputs.cargo-target }}"
+      - uses: actions/download-artifact@v4
+        if: inputs.linux-build != ''
+        with:
+          name: linux-out
+          path: ${{ inputs.linux-out }}
+      - name: Checks
+        run: ${{ inputs.checks }}
+      - name: Bundle
+        run: ${{ inputs.bundle }}
+      - name: Upload checks
+        run: |
+          slop=$(nix build --no-link --print-out-paths .#slop-app)/bin/slop-app
+          "$slop" check "${{ inputs.app }}" "${{ inputs.binary }}"
+          "$slop" zip "${{ inputs.app }}" "${{ inputs.project }}-macos-arm64.zip"
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ZIP: ${{ inputs.project }}-macos-arm64.zip
+        run: |
+          repo=${{ github.repository }}
+          sha=${{ github.sha }}
+          last=${{ needs.changed.outputs.last }}
+          title="Nightly $(date -u +%Y-%m-%d) (${sha:0:7})"
+          # shellcheck disable=SC2016
+          line='"- [`\(.sha[0:7])`](\(.html_url)) \(.commit.message | split("\n")[0])"'
+          {
+            echo "Built from [\`${sha:0:12}\`](https://github.com/$repo/commit/$sha) on $(date -u '+%Y-%m-%d %H:%M UTC')."
+            echo
+            if [ -n "$last" ] && [ "$last" != "$sha" ] &&
+              commits=$(gh api "repos/$repo/compare/$last...$sha" --jq "[.commits[] | $line] | reverse | .[]" 2>/dev/null); then
+              total=$(printf '%s\n' "$commits" | grep -c . || true)
+              echo "## Changes since the previous nightly (${last:0:7})"
+              echo
+              printf '%s\n' "$commits" | head -n 100
+              [ "$total" -le 100 ] || echo "- … and $((total - 100)) more"
+              echo
+              echo "Full diff: https://github.com/$repo/compare/$last...$sha"
+            else
+              echo "## Latest changes"
+              echo
+              gh api "repos/$repo/commits?sha=$sha&per_page=20" --jq ".[] | $line"
+            fi
+            echo
+            echo "Needs macOS 26 on Apple Silicon. The app is not notarised: the first time, open it, then allow it in System Settings > Privacy & Security > Open Anyway."
+            echo
+            echo "This release is replaced every night. Download link that always points at the newest build: https://github.com/$repo/releases/download/nightly/$ZIP"
+          } >notes.md
+          cat notes.md
+          jq -n --arg commit "$sha" --arg date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --arg download "https://github.com/$repo/releases/download/nightly/$ZIP" \
+            --arg release "https://github.com/$repo/releases/tag/nightly" \
+            '{commit: $commit, date: $date, download: $download, release: $release}' >nightly.json
+          if gh release view nightly -R "$repo" >/dev/null 2>&1; then
+            gh api -X PATCH "repos/$repo/git/refs/tags/nightly" -f sha="$sha" -F force=true >/dev/null
+            gh release upload nightly "$ZIP" -R "$repo" --clobber
+            gh release upload nightly nightly.json -R "$repo" --clobber
+            gh release edit nightly -R "$repo" --title "$title" --notes-file notes.md --prerelease
+          else
+            gh release create nightly "$ZIP" nightly.json -R "$repo" --target "$sha" --title "$title" --notes-file notes.md --prerelease
+          fi
